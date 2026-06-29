@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 
 use super::model::SessionConfig;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IpSecForwardPolicyTarget {
     pub interface: String,
     pub uid: i32,
@@ -38,20 +38,51 @@ enum SectionKind {
 
 #[derive(Default)]
 pub struct UpstreamTracker {
-    sessions: HashMap<u64, HashSet<String>>,
+    sessions: HashMap<u64, SessionUpstreams>,
     refcounts: HashMap<String, usize>,
+    emitted_targets: HashSet<IpSecForwardPolicyTarget>,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+struct SessionUpstreams {
+    interfaces: HashSet<String>,
+    upstream_generation: u64,
+}
+
+impl SessionUpstreams {
+    fn from_config(config: &SessionConfig) -> Self {
+        Self {
+            interfaces: config
+                .primary_upstream_interfaces
+                .iter()
+                .chain(config.fallback_upstream_interfaces.iter())
+                .cloned()
+                .collect(),
+            upstream_generation: config.upstream_generation,
+        }
+    }
+
+    fn probe_interfaces(&self) -> Vec<String> {
+        let mut interfaces = self.interfaces.iter().cloned().collect::<Vec<_>>();
+        interfaces.sort_unstable();
+        interfaces
+    }
+
+    fn is_empty(&self) -> bool {
+        self.interfaces.is_empty()
+    }
 }
 
 impl UpstreamTracker {
     pub fn update_session(&mut self, session_id: u64, config: &SessionConfig) -> Vec<String> {
-        let next = config
-            .primary_upstream_interfaces
-            .iter()
-            .chain(config.fallback_upstream_interfaces.iter())
-            .cloned()
-            .collect::<HashSet<_>>();
-        let previous = self.sessions.remove(&session_id).unwrap_or_default();
-        for interface in previous.difference(&next) {
+        let next = SessionUpstreams::from_config(config);
+        let previous = self.sessions.get(&session_id).cloned().unwrap_or_default();
+        if previous == next {
+            return Vec::new();
+        }
+        let upstream_changed = previous.interfaces != next.interfaces
+            || previous.upstream_generation != next.upstream_generation;
+        for interface in previous.interfaces.difference(&next.interfaces) {
             if let Some(count) = self.refcounts.get_mut(interface) {
                 *count -= 1;
                 if *count == 0 {
@@ -59,25 +90,30 @@ impl UpstreamTracker {
                 }
             }
         }
-        let mut entered = Vec::new();
-        for interface in next.difference(&previous) {
+        for interface in next.interfaces.difference(&previous.interfaces) {
             let count = self.refcounts.entry(interface.clone()).or_insert(0);
-            if *count == 0 {
-                entered.push(interface.clone());
-            }
             *count += 1;
         }
-        if !next.is_empty() {
+        self.emitted_targets
+            .retain(|target| self.refcounts.contains_key(&target.interface));
+        let probe = if upstream_changed {
+            next.probe_interfaces()
+        } else {
+            Vec::new()
+        };
+        if next.is_empty() {
+            self.sessions.remove(&session_id);
+        } else {
             self.sessions.insert(session_id, next);
         }
-        entered
+        probe
     }
 
     pub fn remove_session(&mut self, session_id: u64) {
         let Some(previous) = self.sessions.remove(&session_id) else {
             return;
         };
-        for interface in previous {
+        for interface in previous.interfaces {
             if let Some(count) = self.refcounts.get_mut(&interface) {
                 *count -= 1;
                 if *count == 0 {
@@ -85,17 +121,45 @@ impl UpstreamTracker {
                 }
             }
         }
+        self.emitted_targets
+            .retain(|target| self.refcounts.contains_key(&target.interface));
     }
 
     pub fn clear(&mut self) {
         self.sessions.clear();
         self.refcounts.clear();
+        self.emitted_targets.clear();
     }
 
     pub fn session_for_interface(&self, interface: &str) -> Option<u64> {
         self.sessions.iter().find_map(|(session_id, interfaces)| {
-            interfaces.contains(interface).then_some(*session_id)
+            interfaces
+                .interfaces
+                .contains(interface)
+                .then_some(*session_id)
         })
+    }
+
+    pub fn retain_observed_targets(
+        &mut self,
+        interfaces: &[String],
+        targets: &[IpSecForwardPolicyTarget],
+    ) {
+        let interfaces = interfaces
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let targets = targets.iter().cloned().collect::<HashSet<_>>();
+        self.emitted_targets.retain(|target| {
+            !interfaces.contains(target.interface.as_str()) || targets.contains(target)
+        });
+    }
+
+    pub fn session_for_new_target(&mut self, target: &IpSecForwardPolicyTarget) -> Option<u64> {
+        let session_id = self.session_for_interface(&target.interface)?;
+        self.emitted_targets
+            .insert(target.clone())
+            .then_some(session_id)
     }
 }
 
@@ -277,7 +341,12 @@ fn next_section(buffer: &str) -> Option<(usize, SectionKind, &'static str)> {
             .find(TRANSFORM_RECORD_NEEDLE)
             .map(|start| (start, SectionKind::Transform, TRANSFORM_RECORD_NEEDLE)),
     ) {
-        (Some(tunnel), Some(transform)) if tunnel.0 <= transform.0 => Some(tunnel),
+        (Some(tunnel), Some(transform))
+            if tunnel.0 <= transform.0
+                && buffer[tunnel.0..transform.0].contains("mInterfaceName=") =>
+        {
+            Some(tunnel)
+        }
         (Some(_), Some(transform)) => Some(transform),
         (Some(tunnel), None) => Some(tunnel),
         (None, Some(transform)) => Some(transform),
@@ -361,6 +430,13 @@ mUserResourceTracker:
 {1000={mSpiQuotaTracker={mCurrent=2, mMax=64}, mTransformQuotaTracker={mCurrent=2, mMax=64}, mSocketQuotaTracker={mCurrent=1, mMax=16}, mTunnelQuotaTracker={mCurrent=1, mMax=8}, mSpiRecords={}, mTransformRecords={5={mResource={super={mResourceId=5, pid=1763, uid=1000}, mSocket={super={mResourceId=2, pid=1763, uid=1000}, mSocket=java.io.FileDescriptor@8d12f25, mPort=39573}, mSpi.mResourceId=4, mConfig={mMode=TUNNEL, mSourceAddress=10.0.0.62, mDestinationAddress=162.120.192.11, mNetwork=100, mEncapType=2, mEncapSocketResourceId=2, mEncapRemotePort=4500, mNattKeepaliveInterval=0{mSpiResourceId=4, mEncryption=null, mAuthentication=null, mAuthenticatedEncryption={mName=rfc4106(gcm(aes)), mTruncLenBits=128}, mMarkValue=0, mMarkMask=0, mXfrmInterfaceId=1}}, mRefCount=1, mChildren=[]}, 6={mResource={super={mResourceId=6, pid=1763, uid=1000}, mSocket={super={mResourceId=2, pid=1763, uid=1000}, mSocket=java.io.FileDescriptor@8d12f25, mPort=39573}, mSpi.mResourceId=3, mConfig={mMode=TUNNEL, mSourceAddress=162.120.192.11, mDestinationAddress=10.0.0.62, mNetwork=null, mEncapType=2, mEncapSocketResourceId=2, mEncapRemotePort=4500, mNattKeepaliveInterval=0{mSpiResourceId=3, mEncryption=null, mAuthentication=null, mAuthenticatedEncryption={mName=rfc4106(gcm(aes)), mTruncLenBits=128}, mMarkValue=0, mMarkMask=0, mXfrmInterfaceId=1}}, mRefCount=1, mChildren=[]}}}, mEncapSocketRecords={2={mResource={super={mResourceId=2, pid=1763, uid=1000}, mSocket=java.io.FileDescriptor@8d12f25, mPort=39573}, mRefCount=3, mChildren=[]}}, mTunnelInterfaceRecords={1={mResource={super={mResourceId=1, pid=1763, uid=1000}, mInterfaceName=ipsec1, mUnderlyingNetwork=100, mLocalAddress=127.0.0.1, mRemoteAddress=127.0.0.1, mIkey=64512, mOkey=64513}, mRefCount=1, mChildren=[]}}}}
 "#;
 
+    const DUMP_WITH_TRANSFORM_CHILDREN: &str = r#"
+IpSecService dump:
+
+mUserResourceTracker:
+{1000={mSpiQuotaTracker={mCurrent=2, mMax=64}, mTransformQuotaTracker={mCurrent=2, mMax=64}, mSocketQuotaTracker={mCurrent=1, mMax=16}, mTunnelQuotaTracker={mCurrent=1, mMax=8}, mSpiRecords={}, mTransformRecords={47={mResource={super={mResourceId=47, pid=1788, uid=1000}, mSocket={super={mResourceId=44, pid=1788, uid=1000}, mSocket=java.io.FileDescriptor@9515a7a, mPort=36084}, mSpi.mResourceId=46, mConfig={mMode=TUNNEL, mSourceAddress=10.0.0.62, mDestinationAddress=162.120.192.11, mNetwork=128, mEncapType=2, mEncapSocketResourceId=44, mEncapRemotePort=4500, mNattKeepaliveInterval=0{mSpiResourceId=46, mEncryption=null, mAuthentication=null, mAuthenticatedEncryption={mName=rfc4106(gcm(aes)), mTruncLenBits=128}, mMarkValue=0, mMarkMask=0, mXfrmInterfaceId=43}}, mRefCount=1, mChildren=[{mResource={super={mResourceId=44, pid=1788, uid=1000}, mSocket=java.io.FileDescriptor@9515a7a, mPort=36084}, mRefCount=3, mChildren=[]}, {mResource={super={mResourceId=46, pid=1788, uid=1000}, mSpi=189336555, mSourceAddress=, mDestinationAddress=162.120.192.11, mOwnedByTransform=true}, mRefCount=1, mChildren=[]}]}, 48={mResource={super={mResourceId=48, pid=1788, uid=1000}, mSocket={super={mResourceId=44, pid=1788, uid=1000}, mSocket=java.io.FileDescriptor@9515a7a, mPort=36084}, mSpi.mResourceId=45, mConfig={mMode=TUNNEL, mSourceAddress=162.120.192.11, mDestinationAddress=10.0.0.62, mNetwork=null, mEncapType=2, mEncapSocketResourceId=44, mEncapRemotePort=4500, mNattKeepaliveInterval=0{mSpiResourceId=45, mEncryption=null, mAuthentication=null, mAuthenticatedEncryption={mName=rfc4106(gcm(aes)), mTruncLenBits=128}, mMarkValue=0, mMarkMask=0, mXfrmInterfaceId=43}}, mRefCount=1, mChildren=[{mResource={super={mResourceId=44, pid=1788, uid=1000}, mSocket=java.io.FileDescriptor@9515a7a, mPort=36084}, mRefCount=3, mChildren=[]}, {mResource={super={mResourceId=45, pid=1788, uid=1000}, mSpi=1900022394, mSourceAddress=, mDestinationAddress=10.0.0.62, mOwnedByTransform=true}, mRefCount=1, mChildren=[]}]}}, mEncapSocketRecords={44={mResource={super={mResourceId=44, pid=1788, uid=1000}, mSocket=java.io.FileDescriptor@9515a7a, mPort=36084}, mRefCount=3, mChildren=[]}}, mTunnelInterfaceRecords={43={mResource={super={mResourceId=43, pid=1788, uid=1000}, mInterfaceName=ipsec43, mUnderlyingNetwork=128, mLocalAddress=127.0.0.1, mRemoteAddress=127.0.0.1, mIkey=64522, mOkey=64523}, mRefCount=1, mChildren=[]}}}}
+"#;
+
     #[test]
     fn ignores_non_ipsec_interfaces() {
         assert_eq!(
@@ -374,6 +450,22 @@ mUserResourceTracker:
         assert_eq!(
             find_forward_policy_targets(["ipsec1"].into_iter(), DUMP).unwrap(),
             vec![expected_target()]
+        );
+    }
+
+    #[test]
+    fn extracts_forward_policy_target_with_transform_children() {
+        assert_eq!(
+            find_forward_policy_targets(["ipsec43"].into_iter(), DUMP_WITH_TRANSFORM_CHILDREN)
+                .unwrap(),
+            vec![IpSecForwardPolicyTarget {
+                interface: "ipsec43".to_owned(),
+                uid: 1000,
+                source_address: "162.120.192.11".to_owned(),
+                destination_address: "10.0.0.62".to_owned(),
+                mark_value: 64522,
+                xfrm_interface_id: 43,
+            }]
         );
     }
 
@@ -423,28 +515,99 @@ mUserResourceTracker:
     }
 
     #[test]
-    fn tracker_dedupes_and_rechecks_after_reentry() {
+    fn tracker_rechecks_when_upstream_interfaces_change() {
         let mut tracker = UpstreamTracker::default();
         assert_eq!(
             tracker.update_session(1, &session_config(["ipsec1"], ["ipsec1"])),
             vec!["ipsec1".to_owned()]
         );
         assert_eq!(
+            tracker.update_session(2, &session_config(["wlan0"], ["ipsec1"])),
+            vec!["ipsec1".to_owned(), "wlan0".to_owned()]
+        );
+        assert_eq!(
             tracker.update_session(2, &session_config(["ipsec1"], ["wlan0"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            tracker.update_session(2, &session_config(["ipsec1"], ["wlan1"])),
+            vec!["ipsec1".to_owned(), "wlan1".to_owned()]
+        );
+        assert_eq!(
+            tracker.update_session(2, &session_config(["ipsec1"], ["wlan0"])),
+            vec!["ipsec1".to_owned(), "wlan0".to_owned()]
+        );
+        assert_eq!(
+            tracker.update_session(2, &session_config(["wlan0"], [])),
             vec!["wlan0".to_owned()]
         );
         tracker.remove_session(1);
         assert_eq!(
-            tracker.update_session(2, &session_config(["wlan0"], [])),
-            Vec::<String>::new()
-        );
-        assert_eq!(
             tracker.update_session(2, &session_config(["ipsec1"], ["wlan0"])),
-            vec!["ipsec1".to_owned()]
+            vec!["ipsec1".to_owned(), "wlan0".to_owned()]
         );
         assert_eq!(tracker.session_for_interface("ipsec1"), Some(2));
         tracker.remove_session(2);
         assert_eq!(tracker.session_for_interface("ipsec1"), None);
+    }
+
+    #[test]
+    fn tracker_rechecks_when_upstream_generation_changes() {
+        let mut tracker = UpstreamTracker::default();
+        let mut config = session_config(["ipsec1"], ["wlan0"]);
+        config.upstream_generation = 1;
+        assert_eq!(
+            tracker.update_session(1, &config),
+            vec!["ipsec1".to_owned(), "wlan0".to_owned()]
+        );
+        assert_eq!(tracker.update_session(1, &config), Vec::<String>::new());
+
+        config.upstream_generation = 2;
+        assert_eq!(
+            tracker.update_session(1, &config),
+            vec!["ipsec1".to_owned(), "wlan0".to_owned()]
+        );
+
+        let mut fallback = session_config([], ["ipsec1"]);
+        fallback.upstream_generation = 1;
+        assert_eq!(
+            tracker.update_session(2, &fallback),
+            vec!["ipsec1".to_owned()]
+        );
+        fallback.upstream_generation = 2;
+        assert_eq!(
+            tracker.update_session(2, &fallback),
+            vec!["ipsec1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn tracker_emits_each_observed_target_once() {
+        let mut tracker = UpstreamTracker::default();
+        assert_eq!(
+            tracker.update_session(1, &session_config(["ipsec1"], [])),
+            vec!["ipsec1".to_owned()]
+        );
+        let target = expected_target();
+        tracker.retain_observed_targets(&["ipsec1".to_owned()], std::slice::from_ref(&target));
+        assert_eq!(tracker.session_for_new_target(&target), Some(1));
+        assert_eq!(tracker.session_for_new_target(&target), None);
+
+        let mut changed = target.clone();
+        changed.mark_value += 1;
+        tracker.retain_observed_targets(&["ipsec1".to_owned()], std::slice::from_ref(&changed));
+        assert_eq!(tracker.session_for_new_target(&changed), Some(1));
+    }
+
+    #[test]
+    fn tracker_clears_emitted_target_after_interface_disappears() {
+        let mut tracker = UpstreamTracker::default();
+        tracker.update_session(1, &session_config(["ipsec1"], []));
+        let target = expected_target();
+        assert_eq!(tracker.session_for_new_target(&target), Some(1));
+        tracker.update_session(1, &session_config(["wlan0"], []));
+        tracker.update_session(1, &session_config(["ipsec1"], []));
+        assert_eq!(tracker.session_for_new_target(&target), Some(1));
     }
 
     fn session_config(
@@ -468,6 +631,7 @@ mUserResourceTracker:
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            upstream_generation: 0,
             clients: Vec::new(),
             ipv6_nat: None,
         }

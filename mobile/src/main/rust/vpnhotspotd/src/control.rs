@@ -255,11 +255,12 @@ impl State {
         match result {
             Ok(targets) => {
                 let frames = {
-                    let ipsec = self.ipsec.lock().await;
+                    let mut ipsec = self.ipsec.lock().await;
+                    ipsec.retain_observed_targets(interfaces, &targets);
                     targets
                         .into_iter()
                         .filter_map(|target| {
-                            let id = ipsec.session_for_interface(&target.interface)?;
+                            let id = ipsec.session_for_new_target(&target)?;
                             Some(ipsec_forward_policy_frame(id, &target))
                         })
                         .collect::<Vec<_>>()
